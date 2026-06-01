@@ -1,0 +1,3 @@
+data-provider/venv/
+data/*.csv
+__pycache__/
