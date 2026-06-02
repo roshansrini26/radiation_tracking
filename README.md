@@ -1,114 +1,93 @@
-# Radiation Tracking — Project Progress Notes
+# Radiation Tracking — Progress Notes
 
-A running log of what's been built, the concepts behind it, and every command
-needed to reproduce it. Pick up from the **"Where we stopped"** section at the end.
+Command-focused log of what's done and how to reproduce it.
+Jump to **"Where we stopped"** at the end to resume.
 
 ---
 
-## 1. What this project is
-
-A real-time radiation monitoring pipeline using the Safecast dataset.
-
-Data flow (the whole architecture in one line):
+## 1. Project in one line
 
 ```
 [Safecast CSV] -> [Producer] -> [Kafka topic] -> [Flink operators] -> [Map GUI]
 ```
 
-Core rules from the project spec:
-- **Kafka** simulates an infinite live sensor stream (not a database).
-- **Flink** does ALL the processing (filtering, alerts, dedup). The producer and
-  the frontend stay "dumb" — no logic in them.
-- Data is ingested in upload order, but must be **replayed/processed in capture-time
-  order** inside the pipeline. No pre-sorting the file allowed. (This is a Flink
-  event-time problem we tackle later.)
-
-Tech stack: Python producer, Kafka + Flink in Docker, PyFlink for jobs,
-Leaflet map + WebSocket for the frontend (Stage 2).
+Rules: Kafka = dumb stream, Flink = all processing, frontend = display only.
+Ingest in upload order, process in capture-time order, no pre-sorting.
 
 ---
 
-## 2. Key vocabulary (so commands make sense)
-
-**Kafka** = a system that moves streams of messages between programs.
-- **Broker**: the Kafka server itself (runs in Docker).
-- **Topic**: a named channel where messages live (e.g. `radiation-readings`).
-- **Producer**: a program that WRITES messages to a topic (our Python script).
-- **Consumer**: a program that READS messages from a topic (Flink, later).
-- **Partition**: a topic is split into partitions for parallelism. Order is
-  guaranteed only WITHIN one partition.
-
-**Flink** = a system that PROCESSES streams (the "thinking" Kafka avoids).
-- **Job / Topology**: the whole processing program (a graph of steps).
-- **Operator**: one processing step (filter, transform, alert...). Spec wants
-  one operator per functionality.
-- **Source**: where Flink reads in (our Kafka topic).
-- **Sink**: where Flink sends results out (the map, later).
-- **Event time**: when a reading was captured (`captured_at`).
-- **Processing time**: when Flink happens to handle it.
-- **Watermark**: Flink's marker for "I've probably seen everything up to time T"
-  — used to handle out-of-order event-time data. (Comes up later.)
-
-Mental model: producer = the hand dropping items on a conveyor belt;
-Kafka = the belt (just holds/moves, no thinking);
-Flink = the worker at the belt doing the actual work;
-map = the screen on the wall showing results.
-
----
-
-## 3. Project folder structure
+## 2. Folder structure
 
 ```
 radiation_tracking/
-├── docker-compose.yml      # Kafka (and later Flink) setup
-├── data-provider/          # Python producer
-│   ├── venv/               # Python virtual environment (not committed)
-│   └── producer.py         # the Kafka producer
-├── data/                   # the Safecast CSV sample (not committed)
-│   └── safecast_sample.csv
-├── flink-jobs/             # PyFlink jobs (next session)
-└── frontend/               # map GUI (Stage 2)
+├── docker-compose.yml      # kafka + flink (jobmanager + taskmanager)
+├── data-provider/
+│   ├── venv/               # not committed
+│   └── producer.py
+├── data/
+│   └── safecast_sample.csv # not committed
+├── flink-jobs/
+│   ├── Dockerfile          # custom Flink image (python + pyflink + kafka connector)
+│   └── job1_filter.py
+└── frontend/               # Stage 2
 ```
 
 ---
 
-## 4. The data
+## 3. The data
 
-Source: `https://api.safecast.org/system/measurements.csv` (full file ~29GB,
-public domain / CC0). We work against a small sample, NOT the full file.
+Source: `https://api.safecast.org/system/measurements.csv` (full ~29GB, CC0).
+We use a small sample, not the full file.
 
-CSV columns (real headers):
+CSV headers:
 `Captured Time, Latitude, Longitude, Value, Unit, Location Name, Device ID,
 MD5Sum, Height, Surface, Radiation, Uploaded Time, Loader ID`
 
-We use: Captured Time (event time / ordering key), Latitude, Longitude,
-Value (the CPM radiation reading), Unit, Device ID (for dedup later),
-Uploaded Time (ingestion time).
+Used: Captured Time (ordering key), Latitude, Longitude, Value (CPM),
+Unit, Device ID (dedup later), Uploaded Time.
 
-Watch out for:
-- `Captured Time` sometimes has milliseconds, sometimes not — parser must handle both.
-- `Value` arrives as a STRING from CSV — Flink must parse it to a number before
-  doing `value > threshold`.
+Gotchas:
+- `Captured Time` sometimes has milliseconds, sometimes not.
+- `Value` is a STRING from CSV — parse to number in Flink before `value > threshold`.
 
 ---
 
-## 5. Setup commands (from scratch)
+## 4. One-time setup (already done)
 
-### 5.1 Create folder structure
+### 4.1 Folders
 ```bash
 mkdir -p data-provider flink-jobs frontend docker data
 ```
 
-### 5.2 Start Docker
-Open Docker Desktop, wait for the whale icon to go solid. Confirm:
+### 4.2 Download data sample (first ~19MB)
 ```bash
-docker info
+cd data
+curl -r 0-20000000 -o safecast_sample.csv https://api.safecast.org/system/measurements.csv
+head -5 safecast_sample.csv
+wc -l safecast_sample.csv
+cd ..
+```
+(Last row is cut off mid-line — expected, producer skips it.)
+
+### 4.3 Python env + Kafka client (for producer)
+```bash
+cd data-provider
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install confluent-kafka     # hyphen, single package. NOT "confluent kafka"
+cd ..
 ```
 
-### 5.3 Kafka via docker-compose
-The working `docker-compose.yml` (the key fix was using `://:9092` with an
-empty host instead of `0.0.0.0`, which the Kafka image rejects in advertised
-listeners):
+---
+
+## 5. docker-compose.yml (current, with Flink)
+
+Key fixes baked in:
+- Kafka advertised listeners use `://:9092` (empty host), NOT `0.0.0.0` (image rejects it).
+- INTERNAL listener `kafka:19092` added so Flink (own container) reaches Kafka by name.
+- jobmanager/taskmanager build from `flink-jobs/Dockerfile`, tagged `radiation-flink:1.20.0`.
+- `flink-jobs/` mounted into containers at `/opt/flink/jobs`.
 
 ```yaml
 services:
@@ -120,110 +99,155 @@ services:
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092,INTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:19092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-```
 
-Start it:
-```bash
-docker compose up -d
-docker compose ps          # kafka should show "Up"
-docker compose logs kafka  # look for "Kafka Server started"
-```
+  jobmanager:
+    build: ./flink-jobs
+    image: radiation-flink:1.20.0
+    container_name: jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    volumes:
+      - ./flink-jobs:/opt/flink/jobs
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+    depends_on:
+      - kafka
 
-Stop it (when done for the day):
-```bash
-docker compose down
-```
-Note: `down` clears the topic data, but that's fine — the producer regenerates
-it from the CSV.
-
-### 5.4 Download a data sample (first 19MB, not 29GB)
-```bash
-cd data
-curl -r 0-20000000 -o safecast_sample.csv https://api.safecast.org/system/measurements.csv
-head -5 safecast_sample.csv   # inspect columns
-wc -l safecast_sample.csv     # row count (~160k)
-cd ..
-```
-(The last row will be cut off mid-line — that's expected, the producer skips it.)
-
-### 5.5 Python environment + Kafka client
-```bash
-cd data-provider
-python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install confluent-kafka      # NOTE: hyphen, single package. NOT "confluent kafka"
+  taskmanager:
+    build: ./flink-jobs
+    image: radiation-flink:1.20.0
+    container_name: taskmanager
+    command: taskmanager
+    volumes:
+      - ./flink-jobs:/opt/flink/jobs
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager
+        taskmanager.numberOfTaskSlots: 2
+    depends_on:
+      - jobmanager
 ```
 
 ---
 
-## 6. The producer (`producer.py`)
+## 6. flink-jobs/Dockerfile (current)
 
-What it does: reads the CSV row by row, skips structurally broken rows only
-(keeps empty-value rows — discarding those is Flink's job), sends each row to
-Kafka as JSON, waits a configurable delay, repeats.
+Notes:
+- JRE base has no Python — install python3 + pip.
+- PyFlink's `pemja` needs a full JDK to compile -> install `openjdk-11-jdk` + set JAVA_HOME.
+- JAVA_HOME uses `arm64` (Apple Silicon). On Intel it'd be `amd64`.
+- No `--break-system-packages` (older pip in image doesn't support it).
 
-Options:
-- `--file`   path to CSV (default `../data/safecast_sample.csv`)
-- `--broker` Kafka address (default `localhost:9092`)
-- `--topic`  topic name (default `radiation-readings`)
-- `--delay`  seconds between messages (replay speed; 0 = max speed)
-- `--limit`  max rows to send (0 = no limit)
+```dockerfile
+FROM flink:1.20.0-scala_2.12-java11
 
-### Create the topic (once per fresh Kafka)
+RUN apt-get update -y && \
+    apt-get install -y python3 python3-pip python3-dev openjdk-11-jdk && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-arm64
+
+RUN pip3 install --upgrade pip && \
+    pip3 install apache-flink==1.20.0
+
+RUN wget -P /opt/flink/lib \
+    https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-connector-kafka/3.3.0-1.20/flink-sql-connector-kafka-3.3.0-1.20.jar
+```
+
+---
+
+## 7. Build + start the cluster
+
+First time / after Dockerfile change — build once explicitly to avoid the
+double-tag race, then start:
 ```bash
+cd ~/radiation_tracking
+docker compose build jobmanager
+docker compose up -d
+```
+
+Verify:
+```bash
+docker compose ps                             # kafka, jobmanager, taskmanager all "Up"
+docker exec -it jobmanager python --version   # Python 3.10.x
+```
+Dashboard: http://localhost:8081  -> "Available Task Slots" should be 2.
+
+If macOS asks Docker for Documents folder access -> click Allow (needed for volume mount).
+
+---
+
+## 8. Daily restart routine
+
+`docker compose down` wipes the Kafka topic, so recreate it and resubmit the job:
+
+```bash
+cd ~/radiation_tracking
+docker compose up -d           # no --build needed (image cached)
+
+# recreate topic
 docker exec -it kafka /opt/kafka/bin/kafka-topics.sh \
   --create --topic radiation-readings \
   --bootstrap-server localhost:9092 \
   --partitions 1 --replication-factor 1
+
+# resubmit Flink job
+docker exec -it jobmanager flink run -py /opt/flink/jobs/job1_filter.py
 ```
 
-### Run the producer
+Check dashboard (http://localhost:8081) -> job shows green/RUNNING.
+
+---
+
+## 9. Run the pipeline (watch data flow)
+
+Two terminals.
+
+Terminal 1 — producer:
 ```bash
-cd data-provider
+cd ~/radiation_tracking/data-provider
 source venv/bin/activate
-python producer.py --delay 1            # one reading per second, non-stop
-python producer.py --limit 5 --delay 0.5 # quick 5-message test
-python producer.py --delay 0            # firehose (max speed)
+python producer.py --delay 0.5
 ```
+
+Terminal 2 — watch Flink output (runs from anywhere):
+```bash
+docker logs -f taskmanager
+```
+Filtered radiation dicts appear in Terminal 2 = full pipeline working.
+
+Producer options: `--delay` (speed, 0 = max), `--limit N` (stop after N),
+`--topic`, `--broker`, `--file`.
 
 ---
 
-## 7. Watching the stream (two terminals)
+## 10. Flink job management
 
-Both must run at the same time, in separate terminal windows.
-
-**Terminal 1 — consumer (listens, hangs until messages arrive):**
 ```bash
-docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --topic radiation-readings \
-  --bootstrap-server localhost:9092
+docker exec -it jobmanager flink list              # list running jobs + IDs
+docker exec -it jobmanager flink cancel <jobID>    # cancel a job
 ```
-Add `--from-beginning` to see all messages from the start, or
-`--max-messages 5` to auto-exit after 5.
-
-**Terminal 2 — producer:**
-```bash
-cd data-provider && source venv/bin/activate
-python producer.py --delay 1
-```
-
-Watch readings appear one at a time in Terminal 1.
-
-**To stop a running command:** press `Ctrl + C` (the Control key, NOT Cmd).
-Or close the terminal window. Stopping terminals does NOT stop Kafka (it runs
-in Docker independently).
+Or cancel via dashboard: click job -> Cancel Job (top right).
+Note: Flink jobs run on the cluster, NOT in a terminal. Closing terminals does
+not stop a job. Only `flink cancel`, dashboard cancel, or `docker compose down` stops it.
 
 ---
 
-## 8. Useful Kafka admin commands
+## 11. Kafka admin commands
 
 ```bash
 # list topics
@@ -233,59 +257,62 @@ docker exec -it kafka /opt/kafka/bin/kafka-topics.sh \
 # delete a topic
 docker exec -it kafka /opt/kafka/bin/kafka-topics.sh \
   --delete --topic <name> --bootstrap-server localhost:9092
+
+# console consumer (manual check)
+docker exec -it kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --topic radiation-readings --bootstrap-server localhost:9092 \
+  --from-beginning --max-messages 5
 ```
+
+Stop on a running command: `Ctrl + C` (Control key, NOT Cmd). Or close the window.
 
 ---
 
-## 9. Git (commit progress)
+## 12. Git
 
-`.gitignore` (so we don't commit venv / big data files):
+`.gitignore`:
 ```
 data-provider/venv/
 data/*.csv
 __pycache__/
 ```
 
-Commit:
 ```bash
 cd ~/radiation_tracking
 git add .
-git commit -m "Stage 1: Kafka setup + working Safecast producer"
+git commit -m "Stage 1: Flink cluster + first operator (filter empty readings)"
 git push
 ```
 
 ---
 
-## 10. Status checklist
+## 13. Status checklist
 
 Stage 1:
-- [x] Task 1: Kafka set up + configured in Docker
-- [x] Task 2: Data provider (producer) reading Safecast, configurable speed
-- [ ] Task 3: Flink set up + first operator   <-- NEXT SESSION
+- [x] Task 1: Kafka in Docker
+- [x] Task 2: Configurable producer replaying Safecast
+- [x] Task 3: Flink set up + first operator (filter empty values), verified end-to-end
 
 Stage 2 (later):
 - [ ] Web GUI with map
 - [ ] Display processed data on map, configurable display speed
-- [ ] More operators (alerts, dedup, area/time filters)
-- [ ] Cloud deployment + Docker images + README + presentation
+- [ ] More operators (threshold alerts, fixed-sensor dedup, area/time filters)
+- [ ] Cloud deployment + Docker images (DockerHub) + README + presentation
 
 ---
 
-## 11. Where we stopped / next steps
+## 14. Where we stopped / next steps
 
-Kafka + producer fully working and verified (live stream confirmed).
+Done: full Kafka -> Flink pipeline live. First operator (drop empty readings)
+working, verified dicts flowing through to TaskManager logs.
 
-**Next session = Flink (Stage 1, Task 3):**
-1. Add Flink (JobManager + TaskManager) to `docker-compose.yml` next to Kafka.
-2. Re-add an INTERNAL Kafka listener (`kafka:19092`) so Flink — in its own
-   container — can reach Kafka by name across the Docker network.
-3. Write the first PyFlink job: read from `radiation-readings`, parse JSON,
-   drop empty-value rows (the spec's first required operator), print survivors.
+Next session — add operators (in order of difficulty):
+1. Parse `value` to number + threshold alert operator (flag CPM > configurable limit). Easy, demo-friendly. DO THIS NEXT.
+2. Fixed-sensor dedup (key by device_id, Flink keyed state). Medium.
+3. Capture-time ordering (event time + watermarks). Hardest, most interesting.
+   Currently job uses no_watermarks().
 
-Decision already made: run Flink jobs INSIDE the Flink container (not from the
-Mac venv), because PyFlink support on Python 3.14 is unreliable and the Flink
-image ships its own Python.
+Then Stage 2: web map + WebSocket middleware + area/time filters + cloud deploy.
 
-Open watch-item: the capture-time-ordering requirement (event time + watermarks)
-is the trickiest part and comes after the first simple operator works.
-```
+Job file currently uses DataStream API (explicit operators) and reads Kafka at
+`kafka:19092`, starting offset = earliest.

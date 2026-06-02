@@ -1,17 +1,3 @@
-"""
-Safecast Data Provider — Kafka Producer
-
-Reads the Safecast radiation CSV row by row and sends each reading to a Kafka
-topic as a JSON message. This SIMULATES a live sensor stream: rows are emitted
-one at a time, with a configurable delay between them (the "replay speed").
-
-Design rules from the project spec:
-  - The producer is "dumb": it does NO data analysis. It only reads, lightly
-    structures, and emits. All real processing happens later in Flink.
-  - We do NOT pre-sort the file. Rows go out in the order they appear on disk.
-  - Speed is configurable so we can run slow (to watch it) or fast (for a demo).
-"""
-
 import csv
 import json
 import time
